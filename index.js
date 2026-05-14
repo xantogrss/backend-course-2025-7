@@ -1,19 +1,38 @@
+require('dotenv').config(); // Підключаємо секрети з файлу .env
 const { program } = require('commander');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
+const mysql = require('mysql2'); // Додали пакет для бази даних
 
 // 1. Налаштовуємо аргументи командного рядка
 program
-  .requiredOption('-h, --host <type>', 'адреса сервера')
-  .requiredOption('-p, --port <number>', 'порт сервера')
-  .requiredOption('-c, --cache <path>', 'шлях до директорії з кешем');
+  .option('-h, --host <type>', 'адреса сервера', '0.0.0.0')
+  .option('-p, --port <number>', 'порт сервера', process.env.PORT || 3000)
+  .option('-c, --cache <path>', 'шлях до директорії з кешем', './my_cache');
 
 program.parse(process.argv);
 const options = program.opts();
 
-// 2. Створюємо папку для кешу, якщо її немає
+// 2. Налаштування підключення до MySQL (беремо дані з .env)
+const db = mysql.createConnection({
+    host: process.env.DB_HOST || 'db',
+    user: process.env.DB_USER || 'user',
+    password: process.env.DB_PASSWORD || 'password',
+    database: process.env.DB_NAME || 'inventory_db'
+});
+
+// Перевірка з'єднання з БД
+db.connect(err => {
+    if (err) {
+        console.error('Помилка підключення до БД:', err.message);
+    } else {
+        console.log('Успішно підключено до бази даних MySQL');
+    }
+});
+
+// Створюємо папку для кешу, якщо її немає
 if (!fs.existsSync(options.cache)) {
     fs.mkdirSync(options.cache, { recursive: true });
 }
@@ -34,52 +53,44 @@ const upload = multer({ storage: storage });
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Головна сторінка
+// Маршрути (Routes)
 app.get('/', (req, res) => {
-    res.send('Сервіс інвентаризації працює!');
+    res.send('Сервіс інвентаризації (Лабораторна 7) працює!');
 });
 
-// Маршрут для отримання форми реєстрації
 app.get('/register', (req, res) => {
     res.sendFile(path.resolve('RegisterForm.html'));
 });
 
-// ОБРОБКА РЕЄСТРАЦІЇ (виправлено під твою форму)
 app.post('/register', upload.single('photo'), (req, res) => {
     const { name, serial, description } = req.body;
     
     if (!name || !serial || !req.file) {
-        return res.status(400).send('Помилка: назва, серійний номер та фото обов’язкові!');
+        return res.status(400).send('Помилка: дані неповні!');
     }
 
-    const itemData = {
-        name,
-        serial,
-        description: description || '',
-        image: req.file.filename,
-        timestamp: new Date()
-    };
+    // 1. Зберігаємо в базу даних
+    const sql = "INSERT INTO inventory (name, serial, description, image) VALUES (?, ?, ?, ?)";
+    db.query(sql, [name, serial, description, req.file.filename], (err, result) => {
+        if (err) {
+            console.error('Помилка запису в БД:', err);
+            // Не зупиняємо програму, просто логуємо помилку
+        }
+    });
 
-    // Зберігаємо JSON файл у папку кешу
-    const filePath = path.join(options.cache, `${serial}.json`);
-    fs.writeFileSync(filePath, JSON.stringify(itemData, null, 2));
+    // 2. Зберігаємо в JSON файл (як було в лабі 6)
+    const itemData = { name, serial, description, image: req.file.filename, timestamp: new Date() };
+    fs.writeFileSync(path.join(options.cache, `${serial}.json`), JSON.stringify(itemData, null, 2));
 
-    res.send(`Пристрій "${name}" успішно зареєстровано! Перевірте папку кешу.`);
+    res.send(`Пристрій "${name}" успішно зареєстровано в БД та файлі!`);
 });
 
-// 3. Запускаємо сервер
-app.listen(options.port, options.host, () => {
-    console.log(`Сервер запущено на http://${options.host}:${options.port}`);
-    console.log(`Папка для кешу: ${path.resolve(options.cache)}`);
-});
-// Маршрут для форми пошуку
 app.get('/search', (req, res) => {
     res.sendFile(path.resolve('SearchForm.html'));
 });
 
-// ОБРОБКА ПОШУКУ
 app.get('/inventory', (req, res) => {
-    const serial = req.query.serial; // Отримуємо серійник з URL (наприклад, ?serial=SN123)
+    const serial = req.query.serial;
 
     if (!serial) {
         return res.status(400).send('Вкажіть серійний номер!');
@@ -87,24 +98,28 @@ app.get('/inventory', (req, res) => {
 
     const filePath = path.join(options.cache, `${serial}.json`);
 
-    // Перевіряємо, чи існує такий файл
     if (!fs.existsSync(filePath)) {
-        return res.status(404).send('Пристрій не знайдено в базі!');
+        return res.status(404).send('Пристрій не знайдено!');
     }
 
-    // Читаємо дані з файлу
     const rawData = fs.readFileSync(filePath);
     const item = JSON.parse(rawData);
 
-    // Відправляємо дані користувачу
     res.send(`
-        <h1>Дані про пристрій</h1>
+        <h1>Дані про пристрій (з файлу)</h1>
         <p><b>Назва:</b> ${item.name}</p>
         <p><b>Серійний номер:</b> ${item.serial}</p>
         <p><b>Опис:</b> ${item.description}</p>
-        <p><b>Дата реєстрації:</b> ${item.timestamp}</p>
         <p><b>Файл фото:</b> ${item.image}</p>
-        <br>
-        <a href="/search">Шукати інший</a>
+        <br><a href="/search">Шукати інший</a>
     `);
+});
+
+// Запуск сервера
+const PORT = options.port;
+const HOST = options.host;
+
+app.listen(PORT, HOST, () => {
+    console.log(`Сервер працює на http://${HOST}:${PORT}`);
+    console.log(`Кеш зберігається у: ${path.resolve(options.cache)}`);
 });
